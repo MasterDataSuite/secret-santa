@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Secret Santa</title>
+<style>
+:root{--bg:#0f2a1d;--card:#173d2b;--ink:#f5f1e6;--muted:#a9c2b3;--red:#d8423a;--gold:#f2c14e}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;background:radial-gradient(circle at 50% 0,#1d4a35,var(--bg) 70%);color:var(--ink);font:16px/1.5 system-ui,sans-serif;overflow-x:hidden}
+main{max-width:720px;margin:0 auto;padding:32px 16px;position:relative;z-index:1}
+h1{font-size:2.2rem;margin:0 0 4px;text-align:center}
+h3{margin-top:0}
+.sub{color:var(--muted);text-align:center;margin:0 0 24px}
+.card{background:var(--card);border-radius:16px;padding:20px;margin-bottom:16px;box-shadow:0 8px 24px #0005}
+input,button{font:inherit;border-radius:10px;border:0;padding:12px 14px}
+input{width:100%;background:#0d2219;color:var(--ink);margin-bottom:10px}
+button{background:var(--red);color:#fff;cursor:pointer;font-weight:600}
+button:disabled{opacity:.5;cursor:default}
+.ghost{background:transparent;border:1px solid var(--muted);color:var(--muted)}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.players{display:flex;flex-wrap:wrap;gap:10px;justify-content:center}
+.p{background:#0d2219;border-radius:999px;padding:6px 14px;animation:pop .4s}
+.gifts{display:grid;grid-template-columns:repeat(auto-fill,minmax(90px,1fr));gap:12px}
+.gift{font-size:2.6rem;background:#0d2219;border-radius:14px;padding:14px 0;text-align:center;cursor:pointer;transition:transform .15s;color:var(--ink)}
+.gift:hover{transform:scale(1.08) rotate(-3deg)}
+.gift small{display:block;font-size:.8rem;color:var(--muted)}
+.gift.taken{opacity:.35;cursor:default;transform:none}
+.reveal{text-align:center;animation:pop .6s}
+.big{font-size:2.4rem;font-weight:800;color:var(--gold)}
+.err{color:#ff8a80;min-height:1.5em}
+@keyframes pop{from{transform:scale(.3);opacity:0}to{transform:scale(1);opacity:1}}
+.fall{position:fixed;top:-40px;pointer-events:none;animation:fall linear forwards}
+@keyframes fall{to{transform:translateY(110vh) rotate(360deg)}}
+</style>
+</head>
+<body>
+<main>
+  <h1>🎅 Secret Santa</h1>
+  <p class="sub" id="sub">Loading…</p>
+  <div id="host"></div>
+  <div id="panel"></div>
+  <div class="card"><h3>Who's in</h3><div class="players" id="lobby"></div></div>
+</main>
+<script type="module">
+// 1) Paste your Firebase web config here (Firebase console → Project settings → Your apps → Web app)
+const firebaseConfig = {
+  apiKey: "AIzaSyAHm3LvpTsscwUROg0nYN48PBsbdA-vTJo",
+  authDomain: "secret-santa-28672.firebaseapp.com",
+  databaseURL: "https://secret-santa-28672-default-rtdb.europe-west1.firebasedatabase.app",
+  projectId: "secret-santa-28672",
+  appId: "1:677068207030:web:e4c088b9d6a6f4ca18c717",
+};
+
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+import { getDatabase, ref, onValue, set, update, remove, push, runTransaction } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-database.js";
+
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"']/g, c => '&#' + c.charCodeAt(0) + ';');
+const qs = new URLSearchParams(location.search);
+const ROOM = (qs.get('room') || 'team').replace(/[^\w-]/g, '');
+const HOST = qs.has('host');
+const R = `rooms/${ROOM}`;
+const AVATARS = ['🦌','⛄','🎄','🧝','🐧','🍪','🔔','🌟','🧦','🦊','🦉','🍭','🎿','🕯️'];
+
+// --- crypto: each player has an RSA keypair; the private key is locked with their PIN.
+// The draw encrypts "who you give to" with the giver's public key, so only the giver can read it.
+const enc = new TextEncoder(), dec = new TextDecoder();
+const b64 = b => btoa(String.fromCharCode(...new Uint8Array(b)));
+const unb64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+const RSA = { name: 'RSA-OAEP', hash: 'SHA-256' };
+
+async function pinKey(pin, salt) {
+  const base = await crypto.subtle.importKey('raw', enc.encode(pin), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey({ name: 'PBKDF2', salt, iterations: 200000, hash: 'SHA-256' },
+    base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+}
+async function makePlayer(name, pin, wish) {
+  const kp = await crypto.subtle.generateKey({ ...RSA, modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]) }, true, ['encrypt', 'decrypt']);
+  const salt = crypto.getRandomValues(new Uint8Array(16)), iv = crypto.getRandomValues(new Uint8Array(12));
+  const lock = await pinKey(pin, salt);
+  const p = {
+    name, wish, avatar: AVATARS[Math.floor(Math.random() * AVATARS.length)],
+    pub: b64(await crypto.subtle.exportKey('spki', kp.publicKey)),
+    priv: b64(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, lock, await crypto.subtle.exportKey('pkcs8', kp.privateKey))),
+    salt: b64(salt), iv: b64(iv),
+  };
+  return { p, priv: kp.privateKey };
+}
+async function unlock(p, pin) { // throws on wrong PIN
+  const raw = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64(p.iv) }, await pinKey(pin, unb64(p.salt)), unb64(p.priv));
+  return crypto.subtle.importKey('pkcs8', raw, RSA, false, ['decrypt']);
+}
+function shuffle(a) {
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = crypto.getRandomValues(new Uint32Array(1))[0] % (i + 1);
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+// One big loop: everyone gives to the next person in a shuffled circle → nobody gets themselves, no dead ends.
+async function makePairs(players) {
+  const ids = shuffle(Object.keys(players)), pairs = {};
+  for (let i = 0; i < ids.length; i++) {
+    const pub = await crypto.subtle.importKey('spki', unb64(players[ids[i]].pub), RSA, false, ['encrypt']);
+    pairs[ids[i]] = b64(await crypto.subtle.encrypt(RSA, pub, enc.encode(ids[(i + 1) % ids.length])));
+  }
+  return pairs;
+}
+
+// --- app
+if (firebaseConfig.apiKey === 'PASTE') {
+  $('sub').textContent = 'Setup needed: paste your Firebase config into index.html (see README).';
+  throw new Error('missing firebase config');
+}
+const db = getDatabase(initializeApp(firebaseConfig));
+let data = {}, me = null, view = '', busy = false;
+onValue(ref(db, R), s => { data = s.val() || {}; render(); });
+
+function render() {
+  const players = data.players || {}, n = Object.keys(players).length;
+  $('sub').textContent = data.started ? `${n} elves are in. Pick a present!` : `Room “${ROOM}” · ${n} joined`;
+  $('lobby').innerHTML = Object.values(players).map(p => `<span class="p">${p.avatar} ${esc(p.name)}</span>`).join('') || '<span class="sub">Nobody yet…</span>';
+  $('host').innerHTML = HOST ? `<div class="card row"><b>Host controls</b>
+    <button data-act="start" ${data.started || n < 3 ? 'disabled' : ''}>Start the draw (${n})</button>
+    <button class="ghost" data-act="reset">Reset room</button></div>` : '';
+
+  const mine = me && Object.entries(data.opened || {}).find(([, v]) => v === me.id);
+  const v = !me ? 'join' : !data.started ? 'wait' : mine ? 'reveal' : 'gifts';
+  if (v === view && (v === 'join' || v === 'reveal')) return; // don't wipe typing / the reveal
+  view = v;
+
+  if (v === 'join') $('panel').innerHTML = `<div class="card"><h3>Join the draw</h3>
+    <input id="name" placeholder="Your name" maxlength="30" autocomplete="off">
+    <input id="pin" type="password" placeholder="Secret PIN, 4+ characters (remember it!)" maxlength="30">
+    <input id="wish" placeholder="Wishlist / hints for your Santa (optional)" maxlength="140">
+    <button data-act="join">Join 🎄</button><div class="err" id="err"></div>
+    <p class="sub" style="margin:0">Reloaded or on another device? Same name + PIN gets you back in.</p></div>`;
+  if (v === 'wait') $('panel').innerHTML = `<div class="card reveal"><div class="big">${players[me.id].avatar} You're in!</div>
+    <p>Waiting for the host to start the draw…</p></div>`;
+  if (v === 'gifts') {
+    const N = Object.keys(data.pairs || {}).length, opened = data.opened || {};
+    $('panel').innerHTML = `<div class="card"><h3>Pick a present 🎁</h3><div class="gifts">${
+      Array.from({ length: N }, (_, i) => {
+        const who = opened[i + 1] && players[opened[i + 1]];
+        return who ? `<div class="gift taken">${who.avatar}<small>#${i + 1} · ${esc(who.name)}</small></div>`
+                   : `<button class="gift" data-act="pick" data-no="${i + 1}">🎁<small>#${i + 1}</small></button>`;
+      }).join('')}</div></div>`;
+  }
+  if (v === 'reveal') reveal(mine[0]);
+}
+
+async function join() {
+  const name = $('name').value.trim(), pin = $('pin').value, wish = $('wish').value.trim();
+  const err = m => { $('err').textContent = m; busy = false; };
+  if (!name || pin.length < 4) return err('Enter a name and a PIN of at least 4 characters.');
+  if (busy) return; busy = true;
+  $('err').textContent = 'Wrapping your keys…';
+  const found = Object.entries(data.players || {}).find(([, p]) => p.name.toLowerCase() === name.toLowerCase());
+  try {
+    if (found) me = { id: found[0], priv: await unlock(found[1], pin) };
+    else {
+      if (data.started) return err('The draw already started, too late to join 🎅');
+      const id = push(ref(db, `${R}/players`)).key, { p, priv } = await makePlayer(name, pin, wish);
+      await set(ref(db, `${R}/players/${id}`), p);
+      me = { id, priv };
+    }
+    busy = false; render();
+  } catch { err('That name is already taken and the PIN is wrong.'); }
+}
+
+async function start() {
+  if (!confirm(`Start the draw with ${Object.keys(data.players).length} people? Nobody can join after this.`)) return;
+  await update(ref(db, R), { pairs: await makePairs(data.players), started: true });
+}
+
+async function reset() {
+  if (!confirm('Delete everyone and all results in this room?')) return;
+  me = null; view = '';
+  await remove(ref(db, R));
+}
+
+async function pick(no) {
+  if (busy) return; busy = true;
+  await runTransaction(ref(db, `${R}/opened/${no}`), cur => cur ? undefined : me.id); // first click wins
+  busy = false;
+}
+
+async function reveal(no) {
+  const recvId = dec.decode(await crypto.subtle.decrypt(RSA, me.priv, unb64(data.pairs[me.id])));
+  const r = data.players[recvId];
+  $('panel').innerHTML = `<div class="card reveal"><p>You unwrapped present #${no}… you are Secret Santa for</p>
+    <div class="big">${r.avatar} ${esc(r.name)}</div>
+    ${r.wish ? `<p>Their wishlist: <em>${esc(r.wish)}</em></p>` : ''}
+    <p class="sub" style="margin:0">🤫 Keep it secret!</p></div>`;
+  drop(['🎉','✨','🎁','🎊','⭐'], 60, 3);
+}
+
+function drop(chars, count, secs) {
+  for (let i = 0; i < count; i++) {
+    const s = document.createElement('span');
+    s.className = 'fall'; s.textContent = chars[i % chars.length];
+    s.style.cssText = `left:${Math.random() * 100}vw;font-size:${12 + Math.random() * 22}px;animation-duration:${secs + Math.random() * secs}s;animation-delay:${Math.random() * 2}s`;
+    document.body.appendChild(s);
+    setTimeout(() => s.remove(), (secs * 2 + 2) * 1000);
+  }
+}
+setInterval(() => drop(['❄'], 3, 8), 1500); // gentle snow
+
+document.addEventListener('click', e => {
+  const t = e.target.closest('[data-act]'); if (!t) return;
+  ({ join, start, reset, pick: () => pick(t.dataset.no) })[t.dataset.act]();
+});
+document.addEventListener('keydown', e => { if (e.key === 'Enter' && view === 'join') join(); });
+</script>
+</body>
+</html>
